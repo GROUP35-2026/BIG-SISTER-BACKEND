@@ -1,229 +1,287 @@
-// index.js
-// Big Sister backend — minimal Express API.
-//
-// Run with:  node index.js
-// Server listens on http://localhost:5000
-//
-// Endpoints relevant to "Talk to Counsellor":
-//   GET    /api/sessions            -> list all booked sessions
-//   POST   /api/sessions            -> create (book) a new session
-//   PUT    /api/sessions/:id        -> update (edit) a session
-//   DELETE /api/sessions/:id        -> delete a session
-//
-// Plus the auth endpoints your frontend already calls
-// (signup / signin / google-sync) as simple working stubs so the whole
-// app runs end-to-end locally.
+// index.js — Big Sister backend (MariaDB edition)
+// Run: node index.js
+// Requires: .env file with DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, JWT_SECRET
 
-const express = require('express');
-const cors = require('cors');
+require('dotenv').config();
+const express  = require('express');
+const cors     = require('cors');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
 const { nanoid } = require('nanoid');
-const { readDb, writeDb } = require('./db');
+const pool     = require('./db');
 
-const app = express();
-const PORT = 5000;
+const app  = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 
 app.use(cors());
 app.use(express.json());
 
-// ---------------------------------------------------------------------------
-// Simple request logger — handy while you're testing the integration, since
-// you'll see every booking/edit/delete hit the terminal in real time.
-// ---------------------------------------------------------------------------
-app.use((req, res, next) => {
+// ── Request logger ────────────────────────────────────────────────────────────
+app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()}  ${req.method} ${req.url}`);
   next();
 });
 
+// ── JWT middleware (used on protected session routes) ─────────────────────────
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ success: false, message: 'Not authenticated.' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ success: false, message: 'Token invalid or expired.' });
+  }
+}
+
 // =============================================================================
-// AUTH (stubs matching what your frontend already calls)
+// AUTH ROUTES
 // =============================================================================
 
-app.post('/api/auth/signup', (req, res) => {
+// POST /api/auth/signup
+app.post('/api/auth/signup', async (req, res) => {
   const { fullName, email, password, agreeToTerms } = req.body;
-
   if (!fullName || !email || !password) {
-    return res.json({ success: false, message: 'Missing required fields.' });
+    return res.json({ success: false, message: 'Full name, email and password are required.' });
   }
 
-  const db = readDb();
-  const existing = db.users.find((u) => u.email === email);
-  if (existing) {
-    return res.json({ success: false, message: 'An account with this email already exists.' });
+  try {
+    const [rows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    if (rows.length > 0) {
+      return res.json({ success: false, message: 'An account with this email already exists.' });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const id   = nanoid();
+    await pool.query(
+      'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, ?, ?)',
+      [id, fullName, email, hash, agreeToTerms ? 1 : 0]
+    );
+
+    console.log('✅ New user registered:', email);
+    return res.json({ success: true, message: 'Account created! Please log in.' });
+  } catch (err) {
+    console.error('Signup error:', err);
+    return res.status(500).json({ success: false, message: 'Server error during signup.' });
   }
-
-  const newUser = {
-    id: nanoid(),
-    fullName,
-    email,
-    password, // NOTE: plaintext for local dev only. Hash this (e.g. bcrypt) before any real deployment.
-    agreeToTerms: !!agreeToTerms,
-    createdAt: new Date().toISOString()
-  };
-  db.users.push(newUser);
-  writeDb(db);
-
-  return res.json({ success: true, message: 'Account created successfully! Please log in.' });
 });
 
-app.post('/api/auth/signin', (req, res) => {
+// POST /api/auth/signin
+app.post('/api/auth/signin', async (req, res) => {
   const { email, password } = req.body;
-  const db = readDb();
-  const user = db.users.find((u) => u.email === email && u.password === password);
-
-  if (!user) {
-    return res.json({ success: false, message: 'Invalid email or password.' });
+  if (!email || !password) {
+    return res.json({ success: false, message: 'Email and password required.' });
   }
 
-  return res.json({
-    success: true,
-    message: 'Login successful!',
-    token: `dev-token-${user.id}`,
-    user: { id: user.id, fullName: user.fullName, email: user.email }
-  });
+  try {
+    const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    if (rows.length === 0) {
+      return res.json({ success: false, message: 'Invalid email or password.' });
+    }
+
+    const user = rows[0];
+    if (!user.password) {
+      return res.json({ success: false, message: 'This account uses Google sign-in. Please use that instead.' });
+    }
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.json({ success: false, message: 'Invalid email or password.' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, fullName: user.full_name },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    console.log('🔑 User signed in:', email);
+    return res.json({
+      success: true,
+      message: 'Login successful!',
+      token,
+      user: { id: user.id, fullName: user.full_name, email: user.email }
+    });
+  } catch (err) {
+    console.error('Signin error:', err);
+    return res.status(500).json({ success: false, message: 'Server error during signin.' });
+  }
 });
 
-app.post('/api/auth/google-sync', (req, res) => {
+// POST /api/auth/google-sync
+app.post('/api/auth/google-sync', async (req, res) => {
   const { email, name } = req.body;
-  if (!email) {
-    return res.json({ success: false, message: 'No email provided by Google account.' });
-  }
+  if (!email) return res.json({ success: false, message: 'No email provided.' });
 
-  const db = readDb();
-  let user = db.users.find((u) => u.email === email);
-  if (!user) {
-    user = {
-      id: nanoid(),
-      fullName: name || 'Google User',
-      email,
-      password: null,
-      agreeToTerms: true,
-      createdAt: new Date().toISOString()
-    };
-    db.users.push(user);
-    writeDb(db);
-  }
+  try {
+    let [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    let user;
 
-  return res.json({
-    success: true,
-    token: `dev-token-${user.id}`,
-    user: { id: user.id, fullName: user.fullName, email: user.email }
-  });
+    if (rows.length === 0) {
+      // First time — create account (no password for Google users)
+      const id = nanoid();
+      await pool.query(
+        'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, NULL, 1)',
+        [id, name || 'Google User', email]
+      );
+      [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [id]);
+      user = rows[0];
+      console.log('✅ Google user created:', email);
+    } else {
+      user = rows[0];
+      console.log('🔑 Google user signed in:', email);
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, fullName: user.full_name },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      success: true,
+      token,
+      user: { id: user.id, fullName: user.full_name, email: user.email }
+    });
+  } catch (err) {
+    console.error('Google sync error:', err);
+    return res.status(500).json({ success: false, message: 'Server error during Google sync.' });
+  }
 });
 
 // =============================================================================
-// COUNSELLOR SESSIONS — booking / editing / deleting
+// SESSION ROUTES (all protected — require JWT)
 // =============================================================================
 
-// GET /api/sessions
-// Optionally filter by ?userId=xxx once you wire real auth through.
-app.get('/api/sessions', (req, res) => {
-  const db = readDb();
-  const { userId } = req.query;
+// GET /api/sessions  — get all sessions for the logged-in user
+app.get('/api/sessions', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC',
+      [req.user.id]
+    );
 
-  let sessions = db.sessions;
-  if (userId) {
-    sessions = sessions.filter((s) => s.userId === userId);
+    // Map snake_case DB columns → camelCase for the frontend
+    const sessions = rows.map(dbRowToSession);
+    return res.json({ success: true, sessions });
+  } catch (err) {
+    console.error('Fetch sessions error:', err);
+    return res.status(500).json({ success: false, message: 'Could not fetch sessions.' });
   }
-
-  res.json({ success: true, sessions });
 });
 
-// POST /api/sessions  -> book a new session
-app.post('/api/sessions', (req, res) => {
+// POST /api/sessions  — book a new session
+app.post('/api/sessions', requireAuth, async (req, res) => {
   const {
-    userId,
-    counsellorId,
-    counsellorName,
-    counsellorRole,
-    counsellorColor,
-    counsellorAvatar,
-    time,
-    note,
-    anonymous
+    counsellorId, counsellorName, counsellorRole,
+    counsellorColor, counsellorAvatar, time, note, anonymous
   } = req.body;
 
   if (!counsellorId || !time) {
     return res.status(400).json({ success: false, message: 'counsellorId and time are required.' });
   }
 
-  const db = readDb();
+  try {
+    const id = `session_${nanoid()}`;
+    await pool.query(
+      `INSERT INTO sessions
+         (id, user_id, counsellor_id, counsellor_name, counsellor_role,
+          counsellor_color, counsellor_avatar, time_slot, note, anonymous)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, req.user.id, counsellorId, counsellorName, counsellorRole,
+        counsellorColor, counsellorAvatar, time, note || '', anonymous ? 1 : 0
+      ]
+    );
 
-  const newSession = {
-    id: `session_${nanoid()}`,
-    userId: userId || null,
-    counsellorId,
-    counsellorName,
-    counsellorRole,
-    counsellorColor,
-    counsellorAvatar,
-    time,
-    note: note || '',
-    anonymous: !!anonymous,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  db.sessions.push(newSession);
-  writeDb(db);
-
-  console.log('✅ Session booked:', newSession.id, newSession.counsellorName, newSession.time);
-
-  res.status(201).json({ success: true, session: newSession });
+    const [rows] = await pool.query('SELECT * FROM sessions WHERE id = ?', [id]);
+    console.log('✅ Session booked:', id, counsellorName, time);
+    return res.status(201).json({ success: true, session: dbRowToSession(rows[0]) });
+  } catch (err) {
+    console.error('Book session error:', err);
+    return res.status(500).json({ success: false, message: 'Could not book session.' });
+  }
 });
 
-// PUT /api/sessions/:id -> edit an existing session
-app.put('/api/sessions/:id', (req, res) => {
+// PUT /api/sessions/:id  — edit an existing session
+app.put('/api/sessions/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { time, note, anonymous } = req.body;
 
-  const db = readDb();
-  const index = db.sessions.findIndex((s) => s.id === id);
+  try {
+    // Make sure this session belongs to the logged-in user
+    const [rows] = await pool.query(
+      'SELECT * FROM sessions WHERE id = ? AND user_id = ?',
+      [id, req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Session not found.' });
+    }
 
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Session not found.' });
+    await pool.query(
+      'UPDATE sessions SET time_slot = ?, note = ?, anonymous = ? WHERE id = ?',
+      [time ?? rows[0].time_slot, note ?? rows[0].note, anonymous ? 1 : 0, id]
+    );
+
+    const [updated] = await pool.query('SELECT * FROM sessions WHERE id = ?', [id]);
+    console.log('✏️  Session updated:', id);
+    return res.json({ success: true, session: dbRowToSession(updated[0]) });
+  } catch (err) {
+    console.error('Edit session error:', err);
+    return res.status(500).json({ success: false, message: 'Could not update session.' });
   }
-
-  db.sessions[index] = {
-    ...db.sessions[index],
-    time: time ?? db.sessions[index].time,
-    note: note ?? db.sessions[index].note,
-    anonymous: anonymous ?? db.sessions[index].anonymous,
-    updatedAt: new Date().toISOString()
-  };
-
-  writeDb(db);
-
-  console.log('✏️  Session updated:', id);
-
-  res.json({ success: true, session: db.sessions[index] });
 });
 
-// DELETE /api/sessions/:id -> delete a session
-app.delete('/api/sessions/:id', (req, res) => {
+// DELETE /api/sessions/:id  — delete a session
+app.delete('/api/sessions/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
-  const db = readDb();
-  const index = db.sessions.findIndex((s) => s.id === id);
+  try {
+    const [rows] = await pool.query(
+      'SELECT id FROM sessions WHERE id = ? AND user_id = ?',
+      [id, req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Session not found.' });
+    }
 
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Session not found.' });
+    await pool.query('DELETE FROM sessions WHERE id = ?', [id]);
+    console.log('🗑️  Session deleted:', id);
+    return res.json({ success: true, deletedId: id });
+  } catch (err) {
+    console.error('Delete session error:', err);
+    return res.status(500).json({ success: false, message: 'Could not delete session.' });
   }
-
-  const [removed] = db.sessions.splice(index, 1);
-  writeDb(db);
-
-  console.log('🗑️  Session deleted:', id);
-
-  res.json({ success: true, deletedId: removed.id });
 });
 
 // =============================================================================
+// HELPERS
+// =============================================================================
 
-app.get('/', (req, res) => {
-  res.send('Big Sister backend is running. Try GET /api/sessions');
-});
+// Converts a DB row (snake_case) into the camelCase shape the frontend expects
+function dbRowToSession(row) {
+  return {
+    id:              row.id,
+    userId:          row.user_id,
+    counsellorId:    row.counsellor_id,
+    counsellorName:  row.counsellor_name,
+    counsellorRole:  row.counsellor_role,
+    counsellorColor: row.counsellor_color,
+    counsellorAvatar:row.counsellor_avatar,
+    time:            row.time_slot,
+    note:            row.note,
+    anonymous:       row.anonymous === 1,
+    createdAt:       row.created_at,
+    updatedAt:       row.updated_at
+  };
+}
+
+// =============================================================================
+app.get('/', (_req, res) => res.send('Big Sister API is running.'));
 
 app.listen(PORT, () => {
   console.log(`\n🚀 Big Sister backend running at http://localhost:${PORT}`);
-  console.log(`📄 Data is stored in ${__dirname}/db.json — open it anytime to see live changes.\n`);
+  console.log(`🗄️  Connected to MariaDB database: ${process.env.DB_NAME || 'bigsister'}\n`);
 });

@@ -1,37 +1,23 @@
-// db.js
-// Tiny file-based JSON "database". Good enough for development and for you
-// to literally open db.json and watch records appear/change/disappear as
-// you book, edit, and delete sessions from the frontend.
+import mysql from 'mysql2/promise';
 
-const fs = require('fs');
-const path = require('path');
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'bigsister',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-const DB_PATH = path.join(__dirname, 'db.json');
+// Explicitly test the connection and log it when the server boots
+pool.getConnection()
+  .then(connection => {
+    console.log('🗄️  Connected to MariaDB database: bigsister');
+    connection.release();
+  })
+  .catch(err => {
+    console.error('❌ Database connection failed:', err.message);
+  });
 
-function defaultData() {
-  return {
-    users: [],
-    sessions: [] // booked counsellor sessions
-  };
-}
-
-function readDb() {
-  if (!fs.existsSync(DB_PATH)) {
-    writeDb(defaultData());
-  }
-  const raw = fs.readFileSync(DB_PATH, 'utf-8');
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error('db.json was corrupted, resetting to defaults.', err);
-    const fresh = defaultData();
-    writeDb(fresh);
-    return fresh;
-  }
-}
-
-function writeDb(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-module.exports = { readDb, writeDb };
+export default pool;
