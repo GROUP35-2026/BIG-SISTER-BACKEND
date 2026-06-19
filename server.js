@@ -10,8 +10,24 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
 
 // Middleware Configuration
-app.use(cors({ origin: 'http://localhost:5173' })); // Seamless connection with React frontend
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'] })); // Seamless connection with React frontend
 app.use(express.json());
+
+// ── Auth Middleware: verifies the JWT and attaches req.userId ──────────────
+const requireAuth = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'No token provided.' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (_) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+  }
+};
 
 // Base System Status Route
 app.get('/', (req, res) => {
@@ -315,6 +331,207 @@ app.delete('/api/sessions/:id', async (req, res) => {
   } catch (error) {
     console.error('Error deleting session:', error);
     res.status(500).json({ success: false, message: 'Failed to cancel session.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 8: SUBMIT SUPPORT REQUEST (CREATE)
+   ========================================================================== */
+app.post('/api/support-requests', async (req, res) => {
+  try {
+    // Pull userId from the JWT token attached to the request
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    let userId = null;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.userId;
+      } catch (_) { /* token invalid — still allow anonymous submit */ }
+    }
+ 
+    const { category, categoryLabel, firstName, schoolName } = req.body;
+ 
+    if (!category || !firstName || !schoolName) {
+      return res.status(400).json({ success: false, message: 'Category, first name, and school name are required.' });
+    }
+ 
+    const requestId = Date.now().toString();
+ 
+    await db.execute(
+      `INSERT INTO support_requests (id, user_id, category, category_label, first_name, school_name, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'submitted')`,
+      [requestId, userId, category, categoryLabel || category, firstName, schoolName]
+    );
+ 
+    const newRequest = {
+      id:            requestId,
+      userId,
+      category,
+      categoryLabel: categoryLabel || category,
+      firstName,
+      schoolName,
+      status:        'submitted',
+      createdAt:     new Date().toISOString()
+    };
+ 
+    return res.status(201).json({ success: true, request: newRequest });
+ 
+  } catch (error) {
+    console.error('Support Request Create Error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error creating request.' });
+  }
+});
+ 
+/* ==========================================================================
+   ROUTE 9: GET ALL SUPPORT REQUESTS FOR LOGGED-IN USER
+   ========================================================================== */
+app.get('/api/support-requests', async (req, res) => {
+  try {
+    // Verify JWT and extract userId
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ success: false, message: 'No token provided.' });
+ 
+    let userId;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      userId = decoded.userId;
+    } catch (_) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+    }
+ 
+    const [rows] = await db.execute(
+      'SELECT * FROM support_requests WHERE user_id = ? ORDER BY created_at DESC',
+      [userId]
+    );
+ 
+    const requests = rows.map(r => ({
+      id:            r.id,
+      userId:        r.user_id,
+      category:      r.category,
+      categoryLabel: r.category_label,
+      firstName:     r.first_name,
+      schoolName:    r.school_name,
+      status:        r.status,
+      createdAt:     r.created_at
+    }));
+ 
+    return res.status(200).json({ success: true, requests });
+ 
+  } catch (error) {
+    console.error('Support Request Fetch Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to retrieve support requests.' });
+  }
+});
+ 
+/* ==========================================================================
+   ROUTE 10: DELETE SUPPORT REQUEST
+   ========================================================================== */
+app.delete('/api/support-requests/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+ 
+    // Verify JWT
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ success: false, message: 'No token provided.' });
+ 
+    let userId;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      userId = decoded.userId;
+    } catch (_) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+    }
+ 
+    // Only allow deletion of own requests
+    const [check] = await db.execute(
+      'SELECT * FROM support_requests WHERE id = ? AND user_id = ?',
+      [id, userId]
+    );
+    if (check.length === 0) {
+      return res.status(404).json({ success: false, message: 'Request not found or not yours to delete.' });
+    }
+ 
+    const [result] = await db.execute('DELETE FROM support_requests WHERE id = ?', [id]);
+ 
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'Request not found.' });
+    }
+ 
+    return res.status(200).json({ success: true, message: 'Support request removed successfully.' });
+ 
+  } catch (error) {
+    console.error('Support Request Delete Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to remove support request.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 11: UPDATE MY PROFILE EMAIL
+   ========================================================================== */
+app.put('/api/users/me', requireAuth, async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || !email.trim()) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Make sure no other account is already using this email
+    const [existing] = await db.execute(
+      'SELECT id FROM users WHERE email = ? AND id != ?',
+      [normalizedEmail, req.userId]
+    );
+    if (existing.length > 0) {
+      return res.status(400).json({ success: false, message: 'This email is already in use by another account.' });
+    }
+
+    await db.execute('UPDATE users SET email = ? WHERE id = ?', [normalizedEmail, req.userId]);
+
+    const [rows] = await db.execute('SELECT * FROM users WHERE id = ?', [req.userId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+    const user = rows[0];
+
+    return res.status(200).json({
+      success: true,
+      message: 'Email updated successfully.',
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    console.error('Update Email Error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error updating email.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 12: DELETE MY ACCOUNT
+   ========================================================================== */
+app.delete('/api/users/me', requireAuth, async (req, res) => {
+  try {
+    // Clean up everything tied to this user first, then the account itself
+    await db.execute('DELETE FROM sessions WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM support_requests WHERE user_id = ?', [req.userId]);
+
+    const [result] = await db.execute('DELETE FROM users WHERE id = ?', [req.userId]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    return res.status(200).json({ success: true, message: 'Account deleted successfully.' });
+  } catch (error) {
+    console.error('Delete Account Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete account.' });
   }
 });
 
