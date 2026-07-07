@@ -65,8 +65,8 @@ app.post('/api/auth/signup', async (req, res) => {
 
     // 4. Save user record into MariaDB
     await db.execute(
-      'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, ?, ?)',
-      [userId, fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0]
+      'INSERT INTO users (full_name, email, password, agree_terms) VALUES (?, ?, ?, ?)',
+      [fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0]
     );
 
     return res.status(201).json({
