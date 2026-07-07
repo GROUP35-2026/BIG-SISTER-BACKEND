@@ -201,10 +201,10 @@ app.post('/api/sessions', async (req, res) => {
 
     await db.execute(
       `INSERT INTO sessions (
-        id, user_id, counsellor_id, counsellor_name, counsellor_role, 
+        user_id, counsellor_id, counsellor_name, counsellor_role, 
         counsellor_color, counsellor_avatar, time_slot, note, anonymous
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [sessionId, finalUserId, finalCounsellorId, finalCounsellorName, finalCounsellorRole, finalCounsellorColor, finalCounsellorAvatar, finalTimeSlot, note || '', finalAnonymous]
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [finalUserId, finalCounsellorId, finalCounsellorName, finalCounsellorRole, finalCounsellorColor, finalCounsellorAvatar, finalTimeSlot, note || '', finalAnonymous]
     );
 
     // Formatted structure matching what your React state maps over
