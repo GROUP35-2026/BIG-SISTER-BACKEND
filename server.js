@@ -61,12 +61,14 @@ app.post('/api/auth/signup', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
 
     // 3. Generate a distinct ID (Matches VARCHAR(36) in your HeidiSQL setup)
-    const userId = Date.now().toString(); 
+    const userId = Date.now().toString();
 
     // 4. Save user record into MariaDB
+    // FIX: 'id' was previously omitted from the INSERT column list/values,
+    // which threw ER_NO_DEFAULT_FOR_FIELD since users.id has no default.
     await db.execute(
-      'INSERT INTO users (full_name, email, password, agree_terms) VALUES (?, ?, ?, ?)',
-      [fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0]
+      'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, ?, ?)',
+      [userId, fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0]
     );
 
     return res.status(201).json({
@@ -75,7 +77,7 @@ app.post('/api/auth/signup', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Signup Error:', error);
+    console.error('Signup Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server initialization fault.' });
   }
 });
@@ -120,7 +122,7 @@ app.post('/api/auth/signin', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Signin Error:', error);
+    console.error('Signin Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server authentication fault.' });
   }
 });
@@ -147,7 +149,7 @@ app.post('/api/auth/google-sync', async (req, res) => {
         'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, NULL, 1)',
         [userId, name || 'Google User', email.toLowerCase()]
       );
-      
+
       user = { id: userId, full_name: name || 'Google User', email: email.toLowerCase() };
     } else {
       user = users[0];
@@ -166,7 +168,7 @@ app.post('/api/auth/google-sync', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Google Sync Error:', error);
+    console.error('Google Sync Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server Google sync fault.' });
   }
 });
@@ -199,12 +201,16 @@ app.post('/api/sessions', async (req, res) => {
 
     const sessionId = Date.now().toString();
 
+    // FIX: 'id' was previously omitted from the INSERT, so the returned
+    // sessionId never matched what MariaDB actually stored — same
+    // ER_NO_DEFAULT_FOR_FIELD risk as the signup route, and it silently
+    // broke later PUT/DELETE lookups by id.
     await db.execute(
       `INSERT INTO sessions (
-        user_id, counsellor_id, counsellor_name, counsellor_role, 
+        id, user_id, counsellor_id, counsellor_name, counsellor_role, 
         counsellor_color, counsellor_avatar, time_slot, note, anonymous
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [finalUserId, finalCounsellorId, finalCounsellorName, finalCounsellorRole, finalCounsellorColor, finalCounsellorAvatar, finalTimeSlot, note || '', finalAnonymous]
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [sessionId, finalUserId, finalCounsellorId, finalCounsellorName, finalCounsellorRole, finalCounsellorColor, finalCounsellorAvatar, finalTimeSlot, note || '', finalAnonymous]
     );
 
     // Formatted structure matching what your React state maps over
@@ -228,7 +234,7 @@ app.post('/api/sessions', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Database Booking Error:', error);
+    console.error('Database Booking Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server booking fault.' });
   }
 });
@@ -261,7 +267,7 @@ app.get('/api/sessions', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error fetching sessions:', error);
+    console.error('Error fetching sessions:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to retrieve sessions.' });
   }
 });
@@ -308,7 +314,7 @@ app.put('/api/sessions/:id', async (req, res) => {
       session: updatedSessionObj
     });
   } catch (error) {
-    console.error('Error updating session:', error);
+    console.error('Error updating session:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to edit session.' });
   }
 });
@@ -329,7 +335,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
     // Return exactly what React line 87 expects: data.success
     return res.status(200).json({ success: true, message: 'Session deleted successfully.' });
   } catch (error) {
-    console.error('Error deleting session:', error);
+    console.error('Error deleting session:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to cancel session.' });
   }
 });
@@ -378,7 +384,7 @@ app.post('/api/support-requests', async (req, res) => {
     return res.status(201).json({ success: true, request: newRequest });
  
   } catch (error) {
-    console.error('Support Request Create Error:', error);
+    console.error('Support Request Create Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server error creating request.' });
   }
 });
@@ -420,7 +426,7 @@ app.get('/api/support-requests', async (req, res) => {
     return res.status(200).json({ success: true, requests });
  
   } catch (error) {
-    console.error('Support Request Fetch Error:', error);
+    console.error('Support Request Fetch Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to retrieve support requests.' });
   }
 });
@@ -463,7 +469,7 @@ app.delete('/api/support-requests/:id', async (req, res) => {
     return res.status(200).json({ success: true, message: 'Support request removed successfully.' });
  
   } catch (error) {
-    console.error('Support Request Delete Error:', error);
+    console.error('Support Request Delete Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to remove support request.' });
   }
 });
@@ -508,7 +514,7 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Update Email Error:', error);
+    console.error('Update Email Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Internal server error updating email.' });
   }
 });
@@ -530,7 +536,7 @@ app.delete('/api/users/me', requireAuth, async (req, res) => {
 
     return res.status(200).json({ success: true, message: 'Account deleted successfully.' });
   } catch (error) {
-    console.error('Delete Account Error:', error);
+    console.error('Delete Account Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to delete account.' });
   }
 });
