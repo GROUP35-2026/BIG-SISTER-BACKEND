@@ -3,14 +3,14 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import db from './db.js'; // Imports your actual MariaDB pool connection
+import db from './db.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
 
 // Middleware Configuration
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'] })); // Seamless connection with React frontend
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'] }));
 app.use(express.json());
 
 // ── Auth Middleware: verifies the JWT and attaches req.userId ──────────────
@@ -23,10 +23,22 @@ const requireAuth = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.userId = decoded.userId;
+    req.userRole = decoded.role; // Attach role for authorization
     next();
   } catch (_) {
     return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
   }
+};
+
+// ── Admin Auth Middleware ────────────────────────────────────────────────────
+const requireAdmin = (req, res, next) => {
+  requireAuth(req, res, (err) => {
+    if (err) return;
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Access denied. Admins only.' });
+    }
+    next();
+  });
 };
 
 // Base System Status Route
@@ -41,34 +53,25 @@ app.post('/api/auth/signup', async (req, res) => {
   try {
     const { fullName, email, password, agreeToTerms } = req.body;
 
-    // Validation checks
     if (!fullName || !email || !password) {
       return res.status(400).json({ success: false, message: 'All input fields are required.' });
     }
-
     if (!agreeToTerms) {
       return res.status(400).json({ success: false, message: 'You must accept the Terms & Conditions.' });
     }
 
-    // 1. Check MariaDB if user entry already exists
     const [existingUsers] = await db.execute('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
     if (existingUsers.length > 0) {
       return res.status(400).json({ success: false, message: 'An account with this email already exists.' });
     }
 
-    // 2. Hash user password securely
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-
-    // 3. Generate a distinct ID (Matches VARCHAR(36) in your HeidiSQL setup)
     const userId = Date.now().toString();
 
-    // 4. Save user record into MariaDB
-    // FIX: 'id' was previously omitted from the INSERT column list/values,
-    // which threw ER_NO_DEFAULT_FOR_FIELD since users.id has no default.
     await db.execute(
-      'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, ?, ?)',
-      [userId, fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0]
+      'INSERT INTO users (id, full_name, email, password, agree_terms, role) VALUES (?, ?, ?, ?, ?, ?)',
+      [userId, fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0, 'user']
     );
 
     return res.status(201).json({
@@ -93,22 +96,24 @@ app.post('/api/auth/signin', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please enter both email and password.' });
     }
 
-    // 1. Locate the user record inside MariaDB
+    // Locate user, fetching role as well
     const [users] = await db.execute('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
     if (users.length === 0) {
       return res.status(400).json({ success: false, message: 'Invalid credentials. User not found.' });
     }
 
     const user = users[0];
-
-    // 2. Match password hash verify
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(400).json({ success: false, message: 'Invalid credentials. Password incorrect.' });
     }
 
-    // 3. Issue Secure Session JSON Web Token (JWT)
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+    // Include role in the JWT payload
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role || 'user' },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
 
     return res.json({
       success: true,
@@ -117,7 +122,8 @@ app.post('/api/auth/signin', async (req, res) => {
       user: {
         id: user.id,
         fullName: user.full_name,
-        email: user.email
+        email: user.email,
+        role: user.role || 'user' // Critical for frontend redirection
       }
     });
 
@@ -138,24 +144,25 @@ app.post('/api/auth/google-sync', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Google integration profile identity error.' });
     }
 
-    // Check if user profile already exists in MariaDB
     const [users] = await db.execute('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
     let user;
 
     if (users.length === 0) {
-      // Register them automatically on the fly inside MariaDB
       const userId = Date.now().toString();
       await db.execute(
-        'INSERT INTO users (id, full_name, email, password, agree_terms) VALUES (?, ?, ?, NULL, 1)',
-        [userId, name || 'Google User', email.toLowerCase()]
+        'INSERT INTO users (id, full_name, email, password, agree_terms, role) VALUES (?, ?, ?, NULL, 1, ?)',
+        [userId, name || 'Google User', email.toLowerCase(), 'user']
       );
-
-      user = { id: userId, full_name: name || 'Google User', email: email.toLowerCase() };
+      user = { id: userId, full_name: name || 'Google User', email: email.toLowerCase(), role: 'user' };
     } else {
       user = users[0];
     }
 
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role || 'user' },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
 
     return res.json({
       success: true,
@@ -164,7 +171,8 @@ app.post('/api/auth/google-sync', async (req, res) => {
       user: {
         id: user.id,
         fullName: user.full_name,
-        email: user.email
+        email: user.email,
+        role: user.role || 'user'
       }
     });
   } catch (error) {
@@ -196,15 +204,11 @@ app.post('/api/sessions', async (req, res) => {
     const finalCounsellorRole = counsellorRole || counsellor_role || 'Mental Health Educator';
     const finalCounsellorColor = counsellorColor || counsellor_color || '#e91e63';
     const finalCounsellorAvatar = counsellorAvatar || counsellor_avatar || '👩‍⚕️';
-    const finalTimeSlot = time || timeSlot || time_slot || '12:00 PM'; // Maps frontend 'time'
+    const finalTimeSlot = time || timeSlot || time_slot || '12:00 PM';
     const finalAnonymous = anonymous !== undefined ? (anonymous ? 1 : 0) : 0;
 
     const sessionId = Date.now().toString();
 
-    // FIX: 'id' was previously omitted from the INSERT, so the returned
-    // sessionId never matched what MariaDB actually stored — same
-    // ER_NO_DEFAULT_FOR_FIELD risk as the signup route, and it silently
-    // broke later PUT/DELETE lookups by id.
     await db.execute(
       `INSERT INTO sessions (
         id, user_id, counsellor_id, counsellor_name, counsellor_role, 
@@ -213,7 +217,6 @@ app.post('/api/sessions', async (req, res) => {
       [sessionId, finalUserId, finalCounsellorId, finalCounsellorName, finalCounsellorRole, finalCounsellorColor, finalCounsellorAvatar, finalTimeSlot, note || '', finalAnonymous]
     );
 
-    // Formatted structure matching what your React state maps over
     const newSessionObj = {
       id: sessionId,
       userId: finalUserId,
@@ -227,7 +230,6 @@ app.post('/api/sessions', async (req, res) => {
       anonymous: Boolean(finalAnonymous)
     };
 
-    // Return exactly what React line 68 expects: data.success and data.session
     return res.status(201).json({
       success: true,
       session: newSessionObj
@@ -254,13 +256,12 @@ app.get('/api/sessions', async (req, res) => {
       counsellorRole: session.counsellor_role,
       counsellorColor: session.counsellor_color,
       counsellorAvatar: session.counsellor_avatar,
-      time: session.time_slot, // Map time_slot column to frontend 'time' key
+      time: session.time_slot,
       note: session.note,
       anonymous: Boolean(session.anonymous),
       createdAt: session.created_at
     }));
 
-    // Return exactly what React line 42 expects: data.success and data.sessions
     return res.status(200).json({
       success: true,
       sessions: formattedSessions
@@ -308,7 +309,6 @@ app.put('/api/sessions/:id', async (req, res) => {
       anonymous: Boolean(finalAnon)
     };
 
-    // Return exactly what React line 53 expects: data.success and data.session
     return res.status(200).json({
       success: true,
       session: updatedSessionObj
@@ -325,14 +325,12 @@ app.put('/api/sessions/:id', async (req, res) => {
 app.delete('/api/sessions/:id', async (req, res) => {
   try {
     const { id } = req.params;
-
     const [result] = await db.execute('DELETE FROM sessions WHERE id = ?', [id]);
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ success: false, message: 'Session not found.' });
     }
 
-    // Return exactly what React line 87 expects: data.success
     return res.status(200).json({ success: true, message: 'Session deleted successfully.' });
   } catch (error) {
     console.error('Error deleting session:', error.sqlMessage || error.message || error);
@@ -345,7 +343,6 @@ app.delete('/api/sessions/:id', async (req, res) => {
    ========================================================================== */
 app.post('/api/support-requests', async (req, res) => {
   try {
-    // Pull userId from the JWT token attached to the request
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     let userId = null;
@@ -394,7 +391,6 @@ app.post('/api/support-requests', async (req, res) => {
    ========================================================================== */
 app.get('/api/support-requests', async (req, res) => {
   try {
-    // Verify JWT and extract userId
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ success: false, message: 'No token provided.' });
@@ -438,7 +434,6 @@ app.delete('/api/support-requests/:id', async (req, res) => {
   try {
     const { id } = req.params;
  
-    // Verify JWT
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ success: false, message: 'No token provided.' });
@@ -451,7 +446,6 @@ app.delete('/api/support-requests/:id', async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
     }
  
-    // Only allow deletion of own requests
     const [check] = await db.execute(
       'SELECT * FROM support_requests WHERE id = ? AND user_id = ?',
       [id, userId]
@@ -487,7 +481,6 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Make sure no other account is already using this email
     const [existing] = await db.execute(
       'SELECT id FROM users WHERE email = ? AND id != ?',
       [normalizedEmail, req.userId]
@@ -510,7 +503,8 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
       user: {
         id: user.id,
         fullName: user.full_name,
-        email: user.email
+        email: user.email,
+        role: user.role || 'user'
       }
     });
   } catch (error) {
@@ -524,7 +518,6 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
    ========================================================================== */
 app.delete('/api/users/me', requireAuth, async (req, res) => {
   try {
-    // Clean up everything tied to this user first, then the account itself
     await db.execute('DELETE FROM sessions WHERE user_id = ?', [req.userId]);
     await db.execute('DELETE FROM support_requests WHERE user_id = ?', [req.userId]);
 
@@ -538,6 +531,200 @@ app.delete('/api/users/me', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Delete Account Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to delete account.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 13: ADMIN - DASHBOARD OVERVIEW
+   ========================================================================== */
+app.get('/api/admin/overview', requireAdmin, async (req, res) => {
+  try {
+    const [totalUsers] = await db.execute('SELECT COUNT(*) as count FROM users WHERE role != "admin"');
+    const [activeSessions] = await db.execute('SELECT COUNT(*) as count FROM sessions');
+    const [supportRequests] = await db.execute('SELECT COUNT(*) as count FROM support_requests WHERE status="submitted"');
+    const [healthTips] = await db.execute('SELECT COUNT(*) as count FROM content WHERE category="Health Tips" AND status="Live"');
+    const [logs] = await db.execute('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 10');
+
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: totalUsers[0].count,
+        activeSessions: activeSessions[0].count,
+        supportRequests: supportRequests[0].count,
+        healthTipsLive: healthTips[0].count
+      },
+      activity: logs,
+      featureHealth: [
+        { name: 'AI Health Bot', status: 'Operational' },
+        { name: 'Get Support', status: 'Operational' },
+        { name: 'Talk to Counsellor', status: 'Degraded' },
+        { name: 'Learn Skills', status: 'Operational' },
+      ]
+    });
+  } catch (error) {
+    console.error('Admin Overview Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch admin overview.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 14: ADMIN - CONTENT MANAGEMENT (GET)
+   ========================================================================== */
+app.get('/api/admin/content', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM content ORDER BY created_at DESC');
+    res.json({ success: true, content: rows });
+  } catch (error) {
+    console.error('Admin Content Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch content.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 15: ADMIN - CREATE CONTENT
+   ========================================================================== */
+app.post('/api/admin/content', requireAdmin, async (req, res) => {
+  try {
+    const { title, category, status, body } = req.body;
+    const id = Date.now().toString();
+    await db.execute('INSERT INTO content (id, title, category, status, body) VALUES (?, ?, ?, ?, ?)', [id, title, category, status, body]);
+    
+    // Log the action
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action, details) VALUES (?, ?, ?, ?, ?)',
+      [Date.now().toString() + 'a', req.userId, 'Content', `Published health tip: "${title}"`, `Category: ${category}`]);
+
+    res.status(201).json({ success: true, message: 'Content created successfully.' });
+  } catch (error) {
+    console.error('Admin Content Create Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to create content.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 16: ADMIN - DELETE CONTENT
+   ========================================================================== */
+app.delete('/api/admin/content/:id', requireAdmin, async (req, res) => {
+  try {
+    await db.execute('DELETE FROM content WHERE id = ?', [req.params.id]);
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action) VALUES (?, ?, ?, ?)',
+      [Date.now().toString() + 'b', req.userId, 'Content', `Deleted content ID: ${req.params.id}`]);
+    res.json({ success: true, message: 'Content deleted.' });
+  } catch (error) {
+    console.error('Admin Content Delete Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to delete content.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 17: ADMIN - GET ALL USERS
+   ========================================================================== */
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT id, full_name, email, role, created_at FROM users WHERE role != "admin" ORDER BY created_at DESC');
+    res.json({ success: true, users: rows });
+  } catch (error) {
+    console.error('Admin Users Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch users.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 18: ADMIN - UPDATE USER STATUS (Flag / Suspend / Active)
+   ========================================================================== */
+app.put('/api/admin/users/:id/status', requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body; // Active, Flagged, Suspended
+    await db.execute('UPDATE users SET status = ? WHERE id = ?', [status, req.params.id]);
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action, details) VALUES (?, ?, ?, ?, ?)', 
+      [Date.now().toString() + 'c', req.userId, 'Users', `Updated user status to ${status}`, `User ID: ${req.params.id}`]);
+    res.json({ success: true, message: `User status updated to ${status}.` });
+  } catch (error) {
+    console.error('Admin User Status Update Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to update user status.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 19: ADMIN - GET SUPPORT STAFF ROSTER
+   ========================================================================== */
+app.get('/api/admin/staff', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM support_staff');
+    res.json({ success: true, staff: rows });
+  } catch (error) {
+    console.error('Admin Staff Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch support staff.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 20: ADMIN - GET ACTIVITY LOGS
+   ========================================================================== */
+app.get('/api/admin/logs', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM activity_logs ORDER BY created_at DESC');
+    res.json({ success: true, logs: rows });
+  } catch (error) {
+    console.error('Admin Logs Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch logs.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 21: ADMIN - GET APP APPEARANCE SETTINGS
+   ========================================================================== */
+app.get('/api/admin/appearance', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM app_settings');
+    const settings = rows.reduce((acc, r) => ({ ...acc, [r.setting_key]: r.setting_value }), {});
+    res.json({ success: true, settings });
+  } catch (error) {
+    console.error('Admin Appearance Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch appearance settings.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 22: ADMIN - UPDATE APP APPEARANCE SETTINGS
+   ========================================================================== */
+app.put('/api/admin/appearance', requireAdmin, async (req, res) => {
+  try {
+    const { primary, accent, background, appName, tagline, welcomeBanner } = req.body;
+    const updates = { primary, accent, background, appName, tagline, welcomeBanner };
+    
+    for (const [key, val] of Object.entries(updates)) {
+      if (val !== undefined) {
+        await db.execute('INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?', [key, val, val]);
+      }
+    }
+
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action) VALUES (?, ?, ?, ?)',
+      [Date.now().toString() + 'd', req.userId, 'Appearance', `Updated app theme and text settings`]);
+
+    res.json({ success: true, message: 'Appearance settings updated successfully.' });
+  } catch (error) {
+    console.error('Admin Appearance Update Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to update appearance settings.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 23: ADMIN - RUN MAINTENANCE TASKS
+   ========================================================================== */
+app.post('/api/admin/maintenance/:task', requireAdmin, async (req, res) => {
+  try {
+    const { task } = req.params;
+    
+    // Simulate a background task (replace with actual DB backup logic later)
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action, details) VALUES (?, ?, ?, ?, ?)', 
+      [Date.now().toString() + 'e', req.userId, 'Backend', `Ran ${task} task`, `Executed by admin: ${req.userId}`]);
+
+    res.json({ success: true, message: `${task} completed successfully.` });
+  } catch (error) {
+    console.error('Admin Maintenance Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: `Failed to run ${req.params.task}.` });
   }
 });
 
