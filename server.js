@@ -60,7 +60,8 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ success: false, message: 'You must accept the Terms & Conditions.' });
     }
 
-    const [existingUsers] = await db.execute('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
+    const normalizedEmail = email.toLowerCase();
+    const [existingUsers] = await db.execute('SELECT * FROM users WHERE email = ?', [normalizedEmail]);
     if (existingUsers.length > 0) {
       return res.status(400).json({ success: false, message: 'An account with this email already exists.' });
     }
@@ -69,9 +70,15 @@ app.post('/api/auth/signup', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
     const userId = Date.now().toString();
 
+    // 🔥 NEW: Automatically assign admin role if email ends with @admin.com
+    let role = 'user';
+    if (normalizedEmail.endsWith('@admin.com')) {
+      role = 'admin';
+    }
+
     await db.execute(
       'INSERT INTO users (id, full_name, email, password, agree_terms, role) VALUES (?, ?, ?, ?, ?, ?)',
-      [userId, fullName, email.toLowerCase(), hashedPassword, agreeToTerms ? 1 : 0, 'user']
+      [userId, fullName, normalizedEmail, hashedPassword, agreeToTerms ? 1 : 0, role]
     );
 
     return res.status(201).json({
@@ -144,16 +151,24 @@ app.post('/api/auth/google-sync', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Google integration profile identity error.' });
     }
 
-    const [users] = await db.execute('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
+    const normalizedEmail = email.toLowerCase();
+    const [users] = await db.execute('SELECT * FROM users WHERE email = ?', [normalizedEmail]);
     let user;
 
     if (users.length === 0) {
       const userId = Date.now().toString();
+      
+      // 🔥 NEW: Auto-detect admin for Google sign-in as well
+      let role = 'user';
+      if (normalizedEmail.endsWith('@admin.com')) {
+        role = 'admin';
+      }
+
       await db.execute(
         'INSERT INTO users (id, full_name, email, password, agree_terms, role) VALUES (?, ?, ?, NULL, 1, ?)',
-        [userId, name || 'Google User', email.toLowerCase(), 'user']
+        [userId, name || 'Google User', normalizedEmail, role]
       );
-      user = { id: userId, full_name: name || 'Google User', email: email.toLowerCase(), role: 'user' };
+      user = { id: userId, full_name: name || 'Google User', email: normalizedEmail, role: role };
     } else {
       user = users[0];
     }
