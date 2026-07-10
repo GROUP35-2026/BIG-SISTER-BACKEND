@@ -743,7 +743,11 @@ app.post('/api/admin/maintenance/:task', requireAdmin, async (req, res) => {
   }
 });
 
-// Launch Server
-app.listen(PORT, () => {
-  console.log(`🚀 Big Sister Backend Server running on: http://localhost:${PORT}`);
-});
+// Launch Server// at the very bottom, replace app.listen(...) with:
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Big Sister Backend Server running on: http://localhost:${PORT}`);
+  });
+}
+
+export default app;
