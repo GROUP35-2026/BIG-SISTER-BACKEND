@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
 
 // Middleware Configuration
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'] }));
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174', 'https://big-sister-frontend-6uyxg1sxq-kirumira-jordan-s-projects.vercel.app'] }));
 app.use(express.json());
 
 // ── Auth Middleware: verifies the JWT and attaches req.userId ──────────────
