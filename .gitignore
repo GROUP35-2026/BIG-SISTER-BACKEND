@@ -1,0 +1,7 @@
+# create .gitignore with this content:
+node_modules/
+.env
+_env
+*.env
+.DS_Store
+npm-debug.log*
