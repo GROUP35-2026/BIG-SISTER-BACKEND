@@ -8,6 +8,7 @@ import db from './db.js';
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // Middleware Configuration
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174', 'https://big-sister-frontend-6uyxg1sxq-kirumira-jordan-s-projects.vercel.app'] }));
@@ -535,6 +536,11 @@ app.delete('/api/users/me', requireAuth, async (req, res) => {
   try {
     await db.execute('DELETE FROM sessions WHERE user_id = ?', [req.userId]);
     await db.execute('DELETE FROM support_requests WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM ai_chat_messages WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM period_logs WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM symptom_logs WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM cycle_settings WHERE user_id = ?', [req.userId]);
+    await db.execute('DELETE FROM course_progress WHERE user_id = ?', [req.userId]);
 
     const [result] = await db.execute('DELETE FROM users WHERE id = ?', [req.userId]);
 
@@ -627,6 +633,23 @@ app.delete('/api/admin/content/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Admin Content Delete Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: 'Failed to delete content.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 16B: ADMIN - UPDATE CONTENT (used by content edit modal)
+   ========================================================================== */
+app.put('/api/admin/content/:id', requireAdmin, async (req, res) => {
+  try {
+    const { title, category, status, body } = req.body;
+    await db.execute('UPDATE content SET title = ?, category = ?, status = ?, body = ? WHERE id = ?',
+      [title, category, status, body, req.params.id]);
+    await db.execute('INSERT INTO activity_logs (id, admin_id, category, action, details) VALUES (?, ?, ?, ?, ?)',
+      [Date.now().toString() + 'f', req.userId, 'Content', `Updated content: "${title}"`, `Category: ${category}`]);
+    res.json({ success: true, message: 'Content updated.' });
+  } catch (error) {
+    console.error('Admin Content Update Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to update content.' });
   }
 });
 
@@ -740,6 +763,411 @@ app.post('/api/admin/maintenance/:task', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Admin Maintenance Error:', error.sqlMessage || error.message || error);
     res.status(500).json({ success: false, message: `Failed to run ${req.params.task}.` });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 24: AI HEALTH BOT — SEND MESSAGE (calls Anthropic API)
+   ========================================================================== */
+app.post('/api/ai/chat', requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ success: false, message: 'Message cannot be empty.' });
+    }
+
+    // Save the user's message
+    const userMsgId = Date.now().toString();
+    await db.execute(
+      'INSERT INTO ai_chat_messages (id, user_id, role, content) VALUES (?, ?, ?, ?)',
+      [userMsgId, req.userId, 'user', message]
+    );
+
+    // Pull recent history for context (last 10 messages)
+    const [historyRows] = await db.execute(
+      'SELECT role, content FROM ai_chat_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT 10',
+      [req.userId]
+    );
+    const history = historyRows.reverse().map(r => ({ role: r.role, content: r.content }));
+
+    let botReply = "I'm sorry, I couldn't process that right now. Please try again shortly.";
+
+    if (ANTHROPIC_API_KEY) {
+      const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 500,
+          system: "You are Big Sister's AI Health Bot, a warm, supportive, private assistant for teenage girls in Uganda. Answer questions about puberty, menstruation, reproductive health, nutrition, and emotional wellbeing in simple, non-judgmental, age-appropriate language. Never share personal identifying info. Encourage seeking a doctor or counsellor for serious concerns. Keep responses concise (under 150 words).",
+          messages: history
+        })
+      });
+      const data = await apiRes.json();
+      if (data?.content?.length) {
+        botReply = data.content.map(b => b.text || '').join('\n').trim() || botReply;
+      } else if (data?.error) {
+        console.error('Anthropic API error:', data.error);
+      }
+    } else {
+      botReply = "The AI Health Bot isn't fully configured yet (missing API key), but I'm here! For urgent concerns, please use Emergency Help or Talk to a Counsellor.";
+    }
+
+    const botMsgId = Date.now().toString() + '-bot';
+    await db.execute(
+      'INSERT INTO ai_chat_messages (id, user_id, role, content) VALUES (?, ?, ?, ?)',
+      [botMsgId, req.userId, 'assistant', botReply]
+    );
+
+    return res.status(200).json({
+      success: true,
+      reply: { id: botMsgId, role: 'assistant', content: botReply }
+    });
+  } catch (error) {
+    console.error('AI Chat Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Could not reach the AI Health Bot right now.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 25: AI HEALTH BOT — GET CHAT HISTORY
+   ========================================================================== */
+app.get('/api/ai/chat/history', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, role, content, created_at FROM ai_chat_messages WHERE user_id = ? ORDER BY created_at ASC',
+      [req.userId]
+    );
+    res.json({ success: true, messages: rows });
+  } catch (error) {
+    console.error('AI Chat History Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to load chat history.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 26: AI HEALTH BOT — CLEAR CHAT HISTORY
+   ========================================================================== */
+app.delete('/api/ai/chat/history', requireAuth, async (req, res) => {
+  try {
+    await db.execute('DELETE FROM ai_chat_messages WHERE user_id = ?', [req.userId]);
+    res.json({ success: true, message: 'Chat history cleared.' });
+  } catch (error) {
+    console.error('AI Chat Clear Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to clear chat history.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 27: TRACK HEALTH — GET CYCLE SETTINGS + LOGS FOR A MONTH
+   ========================================================================== */
+app.get('/api/health/cycle', requireAuth, async (req, res) => {
+  try {
+    const [settingsRows] = await db.execute('SELECT * FROM cycle_settings WHERE user_id = ?', [req.userId]);
+    let settings = settingsRows[0];
+    if (!settings) {
+      await db.execute(
+        'INSERT INTO cycle_settings (user_id, avg_cycle_length, avg_period_length) VALUES (?, 28, 5)',
+        [req.userId]
+      );
+      settings = { user_id: req.userId, avg_cycle_length: 28, avg_period_length: 5, last_period_start: null };
+    }
+
+    const [periodRows] = await db.execute(
+      'SELECT log_date, flow, is_period_day FROM period_logs WHERE user_id = ? ORDER BY log_date ASC',
+      [req.userId]
+    );
+    const [symptomRows] = await db.execute(
+      'SELECT log_date, symptom, severity FROM symptom_logs WHERE user_id = ? ORDER BY log_date DESC LIMIT 60',
+      [req.userId]
+    );
+
+    // Basic derived stats
+    let cycleDay = null;
+    let nextPeriodInDays = null;
+    if (settings.last_period_start) {
+      const start = new Date(settings.last_period_start);
+      const today = new Date();
+      const diffDays = Math.floor((today - start) / (1000 * 60 * 60 * 24));
+      cycleDay = (diffDays % settings.avg_cycle_length) + 1;
+      nextPeriodInDays = settings.avg_cycle_length - (diffDays % settings.avg_cycle_length);
+    }
+
+    res.json({
+      success: true,
+      settings: {
+        avgCycleLength: settings.avg_cycle_length,
+        avgPeriodLength: settings.avg_period_length,
+        lastPeriodStart: settings.last_period_start
+      },
+      cycleDay,
+      nextPeriodInDays,
+      periodLogs: periodRows,
+      symptomLogs: symptomRows
+    });
+  } catch (error) {
+    console.error('Cycle Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch cycle data.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 28: TRACK HEALTH — LOG / UPDATE A PERIOD DAY
+   ========================================================================== */
+app.post('/api/health/period-log', requireAuth, async (req, res) => {
+  try {
+    const { date, flow, isPeriodDay } = req.body;
+    if (!date) return res.status(400).json({ success: false, message: 'Date is required.' });
+
+    const logId = `${req.userId}-${date}`;
+    await db.execute(
+      `INSERT INTO period_logs (id, user_id, log_date, flow, is_period_day)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE flow = VALUES(flow), is_period_day = VALUES(is_period_day)`,
+      [logId, req.userId, date, flow || null, isPeriodDay ? 1 : 0]
+    );
+
+    // If marking the first day of a new period, update last_period_start if this date is more recent
+    if (isPeriodDay) {
+      const [settingsRows] = await db.execute('SELECT * FROM cycle_settings WHERE user_id = ?', [req.userId]);
+      const current = settingsRows[0];
+      if (!current || !current.last_period_start || new Date(date) > new Date(current.last_period_start)) {
+        await db.execute(
+          `INSERT INTO cycle_settings (user_id, last_period_start) VALUES (?, ?)
+           ON DUPLICATE KEY UPDATE last_period_start = VALUES(last_period_start)`,
+          [req.userId, date]
+        );
+      }
+    }
+
+    res.status(200).json({ success: true, message: 'Period log saved.' });
+  } catch (error) {
+    console.error('Period Log Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to save period log.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 29: TRACK HEALTH — LOG A SYMPTOM
+   ========================================================================== */
+app.post('/api/health/symptom-log', requireAuth, async (req, res) => {
+  try {
+    const { date, symptom, severity } = req.body;
+    if (!date || !symptom) return res.status(400).json({ success: false, message: 'Date and symptom are required.' });
+
+    const logId = Date.now().toString();
+    await db.execute(
+      'INSERT INTO symptom_logs (id, user_id, log_date, symptom, severity) VALUES (?, ?, ?, ?, ?)',
+      [logId, req.userId, date, symptom, severity || 'mild']
+    );
+
+    res.status(201).json({ success: true, message: 'Symptom logged.' });
+  } catch (error) {
+    console.error('Symptom Log Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to log symptom.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 30: TRACK HEALTH — UPDATE CYCLE SETTINGS
+   ========================================================================== */
+app.put('/api/health/cycle-settings', requireAuth, async (req, res) => {
+  try {
+    const { avgCycleLength, avgPeriodLength, lastPeriodStart } = req.body;
+    await db.execute(
+      `INSERT INTO cycle_settings (user_id, avg_cycle_length, avg_period_length, last_period_start)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         avg_cycle_length = VALUES(avg_cycle_length),
+         avg_period_length = VALUES(avg_period_length),
+         last_period_start = VALUES(last_period_start)`,
+      [req.userId, avgCycleLength || 28, avgPeriodLength || 5, lastPeriodStart || null]
+    );
+    res.json({ success: true, message: 'Cycle settings updated.' });
+  } catch (error) {
+    console.error('Cycle Settings Update Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to update cycle settings.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 31: LEARN SKILLS — GET ALL COURSES (+ user progress if logged in)
+   ========================================================================== */
+app.get('/api/courses', async (req, res) => {
+  try {
+    const [courses] = await db.execute('SELECT * FROM courses WHERE status = "Live" ORDER BY created_at ASC');
+
+    let progressMap = {};
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const [progressRows] = await db.execute('SELECT * FROM course_progress WHERE user_id = ?', [decoded.userId]);
+        progressRows.forEach(p => { progressMap[p.course_id] = p; });
+      } catch (_) { /* not logged in or invalid token — just skip progress */ }
+    }
+
+    const formatted = courses.map(c => ({
+      id: c.id,
+      title: c.title,
+      description: c.description,
+      icon: c.icon_emoji,
+      color: c.color_hex,
+      durationWeeks: c.duration_weeks,
+      percentComplete: progressMap[c.id]?.percent_complete || 0,
+      completed: Boolean(progressMap[c.id]?.completed)
+    }));
+
+    res.json({ success: true, courses: formatted });
+  } catch (error) {
+    console.error('Courses Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch courses.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 32: LEARN SKILLS — UPDATE MY PROGRESS ON A COURSE
+   ========================================================================== */
+app.put('/api/courses/:id/progress', requireAuth, async (req, res) => {
+  try {
+    const { percentComplete } = req.body;
+    const clamped = Math.max(0, Math.min(100, Number(percentComplete) || 0));
+    const progressId = `${req.userId}-${req.params.id}`;
+    await db.execute(
+      `INSERT INTO course_progress (id, user_id, course_id, percent_complete, completed)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE percent_complete = VALUES(percent_complete), completed = VALUES(completed)`,
+      [progressId, req.userId, req.params.id, clamped, clamped >= 100 ? 1 : 0]
+    );
+    res.json({ success: true, message: 'Progress updated.' });
+  } catch (error) {
+    console.error('Course Progress Update Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to update progress.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 33: LEARN SKILLS — ADMIN CREATE/LIST COURSES
+   ========================================================================== */
+app.get('/api/admin/courses', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM courses ORDER BY created_at DESC');
+    res.json({ success: true, courses: rows });
+  } catch (error) {
+    console.error('Admin Courses Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch courses.' });
+  }
+});
+
+app.post('/api/admin/courses', requireAdmin, async (req, res) => {
+  try {
+    const { title, description, icon, color, durationWeeks, status } = req.body;
+    const id = Date.now().toString();
+    await db.execute(
+      'INSERT INTO courses (id, title, description, icon_emoji, color_hex, duration_weeks, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, title, description || '', icon || '📘', color || '#9333ea', durationWeeks || 4, status || 'Draft']
+    );
+    res.status(201).json({ success: true, message: 'Course created.' });
+  } catch (error) {
+    console.error('Admin Course Create Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to create course.' });
+  }
+});
+
+app.delete('/api/admin/courses/:id', requireAdmin, async (req, res) => {
+  try {
+    await db.execute('DELETE FROM courses WHERE id = ?', [req.params.id]);
+    res.json({ success: true, message: 'Course deleted.' });
+  } catch (error) {
+    console.error('Admin Course Delete Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to delete course.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 34: EXPLORE TOPICS — GET ALL TOPICS
+   ========================================================================== */
+app.get('/api/topics', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM topics WHERE status = "Live" ORDER BY created_at ASC');
+    const formatted = rows.map(t => ({
+      id: t.id,
+      title: t.title,
+      subtitle: t.subtitle,
+      body: t.body,
+      icon: t.icon_emoji,
+      color: t.color_hex,
+      readMinutes: t.read_minutes,
+      articleCount: t.article_count
+    }));
+    res.json({ success: true, topics: formatted });
+  } catch (error) {
+    console.error('Topics Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch topics.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 35: EXPLORE TOPICS — ADMIN CREATE/DELETE
+   ========================================================================== */
+app.get('/api/admin/topics', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM topics ORDER BY created_at DESC');
+    res.json({ success: true, topics: rows });
+  } catch (error) {
+    console.error('Admin Topics Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch topics.' });
+  }
+});
+
+app.post('/api/admin/topics', requireAdmin, async (req, res) => {
+  try {
+    const { title, subtitle, body, icon, color, readMinutes, articleCount, status } = req.body;
+    const id = Date.now().toString();
+    await db.execute(
+      'INSERT INTO topics (id, title, subtitle, body, icon_emoji, color_hex, read_minutes, article_count, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, title, subtitle || '', body || '', icon || '📖', color || '#9023F0', readMinutes || 5, articleCount || 1, status || 'Draft']
+    );
+    res.status(201).json({ success: true, message: 'Topic created.' });
+  } catch (error) {
+    console.error('Admin Topic Create Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to create topic.' });
+  }
+});
+
+app.delete('/api/admin/topics/:id', requireAdmin, async (req, res) => {
+  try {
+    await db.execute('DELETE FROM topics WHERE id = ?', [req.params.id]);
+    res.json({ success: true, message: 'Topic deleted.' });
+  } catch (error) {
+    console.error('Admin Topic Delete Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to delete topic.' });
+  }
+});
+
+/* ==========================================================================
+   ROUTE 36: EMERGENCY HELP — GET CONTACTS
+   ========================================================================== */
+app.get('/api/emergency-contacts', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM emergency_contacts ORDER BY sort_order ASC');
+    const formatted = rows.map(c => ({
+      id: c.id,
+      name: c.name,
+      phone: c.phone,
+      hours: c.hours,
+      icon: c.icon_emoji,
+      color: c.color_hex
+    }));
+    res.json({ success: true, contacts: formatted });
+  } catch (error) {
+    console.error('Emergency Contacts Fetch Error:', error.sqlMessage || error.message || error);
+    res.status(500).json({ success: false, message: 'Failed to fetch emergency contacts.' });
   }
 });
 
