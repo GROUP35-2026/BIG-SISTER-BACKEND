@@ -19,6 +19,7 @@ app.use(cors({
     'https://big-sister-frontend-6uyxg1sxq-kirumira-jordan-s-projects.vercel.app'
   ]
 }));
+app.use(express.json());
 
 // ── Auth Middleware: verifies the JWT and attaches req.userId ──────────────
 const requireAuth = (req, res, next) => {
