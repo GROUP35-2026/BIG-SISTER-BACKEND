@@ -11,8 +11,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // Middleware Configuration
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174', 'https://big-sister-frontend-6uyxg1sxq-kirumira-jordan-s-projects.vercel.app'] }));
-app.use(express.json());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://big-sister-frontend-wine.vercel.app',
+    'https://big-sister-frontend-6uyxg1sxq-kirumira-jordan-s-projects.vercel.app'
+  ]
+}));
 
 // ── Auth Middleware: verifies the JWT and attaches req.userId ──────────────
 const requireAuth = (req, res, next) => {
